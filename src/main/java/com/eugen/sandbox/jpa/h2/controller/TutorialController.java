@@ -1,15 +1,22 @@
 package com.eugen.sandbox.jpa.h2.controller;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 
-import com.eugen.sandbox.grpc.CreateTutorialRequest;
-import com.eugen.sandbox.grpc.CreateTutorialResponse;
 import com.eugen.sandbox.grpc.CreateTutorialServiceGrpc;
+import com.eugen.sandbox.grpc.Input;
+import com.eugen.sandbox.grpc.Response;
+import com.eugen.sandbox.grpc.ResponseType;
+import com.eugen.sandbox.jpa.h2.dto.ResponseDTO;
 import com.eugen.sandbox.jpa.h2.repository.TutorialRepository;
+import io.grpc.CallCredentials;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
+import io.grpc.stub.StreamObserver;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -26,6 +33,9 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.eugen.sandbox.jpa.h2.model.Tutorial;
 
+import static java.lang.Math.toIntExact;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
 @CrossOrigin(origins = "http://localhost:8081")
 @RestController
 @RequestMapping("/api")
@@ -34,23 +44,182 @@ public class TutorialController {
 	@Autowired
     TutorialRepository tutorialRepository;
 
-	@PostMapping("/grpctest")
-	public ResponseEntity<Boolean> testGrpcCreate(@RequestBody Tutorial tutorial){
+	@PostMapping("/grpccreatesingletutorial")
+	public ResponseEntity<ResponseDTO> testGrpcCreate(@RequestBody Tutorial tutorial){
 		try {
 			ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
 					.usePlaintext()
 					.build();
 			CreateTutorialServiceGrpc.CreateTutorialServiceBlockingStub stub = CreateTutorialServiceGrpc.newBlockingStub(channel);
 
-			CreateTutorialResponse response = stub.create(CreateTutorialRequest.newBuilder()
+			Response response = stub.create(com.eugen.sandbox.grpc.Tutorial.newBuilder()
 					.setDescription(tutorial.getDescription())
 					.setPublished(tutorial.isPublished())
 					.setTitle(tutorial.getTitle())
 					.build());
 
-			return new ResponseEntity<>(response.getResponse(), HttpStatus.CREATED);
+			return new ResponseEntity<>(
+					new ResponseDTO(response.getCreatedTutorials(), response.getNotCreatedTutorials(), response.getElapsedTime(), response.getResponse()),
+					HttpStatus.CREATED);
 		} catch (Exception e) {
-			return new ResponseEntity<>(false, HttpStatus.INTERNAL_SERVER_ERROR);
+			return new ResponseEntity<>(
+					new ResponseDTO(0, 0, 0, "ERROR"),
+					HttpStatus.INTERNAL_SERVER_ERROR
+			);
+		}
+	}
+
+	@GetMapping("/grpctutorials")
+	public ResponseEntity<List<Tutorial>> getAllTutorialsWithGRPC(@RequestParam(required = false) String title) {
+		try{
+			ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+					.usePlaintext()
+					.build();
+
+			title = title==null?"":title;
+			Input input = Input.newBuilder()
+					.setSearchString(title)
+					.build();
+			CreateTutorialServiceGrpc.CreateTutorialServiceBlockingStub stub = CreateTutorialServiceGrpc.newBlockingStub(channel);
+
+			Iterator<com.eugen.sandbox.grpc.Tutorial> tutorialIterator = stub.listAllTutorials(input);
+
+			List<Tutorial> response = new ArrayList<>();
+
+			tutorialIterator.forEachRemaining(tutorial -> response.add(new Tutorial(tutorial.getId(), tutorial.getTitle(), tutorial.getDescription(), tutorial.getPublished())));
+
+			return new ResponseEntity<>(response, HttpStatus.OK);
+		}catch (Exception e){
+			return new ResponseEntity<>(null, HttpStatus.INTERNAL_SERVER_ERROR);
+		}
+	}
+
+	@PostMapping("/grpccreatemultipletutorial")
+	public ResponseEntity<ResponseDTO> createAllTutorialsWithGRPC(@RequestBody List<Tutorial> tutorials){
+		List<Response> responseAll = new ArrayList<>();
+		long startTime = System.nanoTime();
+		try{
+			ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+					.usePlaintext()
+					.build();
+			CreateTutorialServiceGrpc.CreateTutorialServiceStub stub = CreateTutorialServiceGrpc.newStub(channel);
+
+			StreamObserver<com.eugen.sandbox.grpc.Tutorial> tutorialStreamObserver = stub.createTutorials(new StreamObserver<Response>() {
+				@Override
+				public void onNext(Response response) {
+					responseAll.add(response);
+					System.out.println("next");
+				}
+
+				@Override
+				public void onError(Throwable throwable) {
+					// elaborate top notch error handling
+					System.out.println(throwable.getMessage());
+				}
+
+				@Override
+				public void onCompleted() {
+					System.out.println("complete");
+				}
+			});
+			tutorials.forEach(
+					tutorial -> tutorialStreamObserver.onNext(
+							com.eugen.sandbox.grpc.Tutorial.newBuilder()
+									.setTitle(tutorial.getTitle())
+									.setPublished(tutorial.isPublished())
+									.setDescription(tutorial.getDescription())
+									.build()));
+
+			int notCreatedTutorials = responseAll.stream().mapToInt(Response::getNotCreatedTutorials).sum();
+			int createdTutorials = responseAll.stream().mapToInt(Response::getCreatedTutorials).sum();
+			long seconds = NANOSECONDS.toSeconds(System.nanoTime() - startTime);
+			return new ResponseEntity<>(
+					new ResponseDTO(createdTutorials, notCreatedTutorials, toIntExact(seconds), "OK"),
+					HttpStatus.OK);
+		}catch (Exception e){
+			long seconds = NANOSECONDS.toSeconds(System.nanoTime() - startTime);
+			return new ResponseEntity<>(
+					new ResponseDTO(0, tutorials.size(), toIntExact(seconds), "ERROR"),
+					HttpStatus.INTERNAL_SERVER_ERROR
+			);
+		}
+	}
+
+
+	@PostMapping("/grpcvalidate")
+	public ResponseEntity<ResponseDTO> validateAllTutorials(@RequestBody List<Tutorial> tutorials){
+		List<Response> responseAll = new ArrayList<>();
+		long startTime = System.nanoTime();
+		try{
+			ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+					.usePlaintext()
+					.build();
+			CreateTutorialServiceGrpc.CreateTutorialServiceStub stub = CreateTutorialServiceGrpc.newStub(channel);
+
+			StreamObserver<com.eugen.sandbox.grpc.Tutorial> tutorialStreamObserver = stub.validateTutorials(new StreamObserver<com.eugen.sandbox.grpc.Tutorial>() {
+				@Override
+				public void onNext(com.eugen.sandbox.grpc.Tutorial tutorial) {
+					if(tutorial==null){
+						System.out.println("received nothing");
+					}else{
+						System.out.println("recieved tutorial"+tutorial.getTitle());
+					}
+				}
+
+				@Override
+				public void onError(Throwable throwable) {
+					// elaborate top notch error handling
+					System.out.println(throwable.getMessage());
+				}
+
+				@Override
+				public void onCompleted() {
+					System.out.println("completed");
+				}
+			});
+			tutorials.forEach(
+					tutorial -> tutorialStreamObserver.onNext(
+							com.eugen.sandbox.grpc.Tutorial.newBuilder()
+									.setTitle(tutorial.getTitle())
+									.setPublished(tutorial.isPublished())
+									.setDescription(tutorial.getDescription())
+									.build()));
+
+			long seconds = NANOSECONDS.toSeconds(System.nanoTime() - startTime);
+			return new ResponseEntity<>(
+					new ResponseDTO(0, 0, toIntExact(seconds), "OK"),
+					HttpStatus.OK);
+		}catch (Exception e){
+			long seconds = NANOSECONDS.toSeconds(System.nanoTime() - startTime);
+			return new ResponseEntity<>(
+					new ResponseDTO(0, tutorials.size(), toIntExact(seconds), "ERROR"),
+					HttpStatus.INTERNAL_SERVER_ERROR
+			);
+		}
+	}
+
+	@PostMapping("/grpccreatesingletutorialauthorized")
+	public ResponseEntity<ResponseDTO> testGrpcCreateAuthorized(@RequestBody Tutorial tutorial){
+		try {
+			ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+					.usePlaintext()
+					.build();
+			CreateTutorialServiceGrpc.CreateTutorialServiceBlockingStub stub = CreateTutorialServiceGrpc.newBlockingStub(channel);
+
+			Response response = stub.create(com.eugen.sandbox.grpc.Tutorial.newBuilder()
+					.setDescription(tutorial.getDescription())
+					.setPublished(tutorial.isPublished())
+					.setTitle(tutorial.getTitle())
+					.build());
+
+			return new ResponseEntity<>(
+					new ResponseDTO(response.getCreatedTutorials(), response.getNotCreatedTutorials(), response.getElapsedTime(), response.getResponse()),
+					HttpStatus.CREATED);
+		} catch (Exception e) {
+			return new ResponseEntity<>(
+					new ResponseDTO(0, 0, 0, "ERROR"),
+					HttpStatus.INTERNAL_SERVER_ERROR
+			);
 		}
 	}
 
